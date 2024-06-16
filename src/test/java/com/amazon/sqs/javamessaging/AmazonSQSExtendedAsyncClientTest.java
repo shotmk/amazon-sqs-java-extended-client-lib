@@ -35,6 +35,7 @@ import software.amazon.awssdk.core.ApiName;
 import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.async.AsyncResponseTransformer;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectResponse;
@@ -404,7 +405,7 @@ public class AmazonSQSExtendedAsyncClientTest {
             700_000,
             800_000,
             900_000,
-            200_000,
+            150_000,
             1000_000
         };
 
@@ -425,6 +426,43 @@ public class AmazonSQSExtendedAsyncClientTest {
 
         // There should be 8 puts for the 8 messages above the threshold
         verify(mockS3, times(8)).putObject(isA(PutObjectRequest.class), isA(AsyncRequestBody.class));
+    }
+
+
+    @Test
+    public void testWhenMessageBatchWithTotalSizeOverTheLimitIsSentThenLargestEntriesAreStoredInS3() {
+        // This creates 10 messages, out of which only two are below the threshold (100K and 150K),
+        // and the other 8 are above the threshold
+
+        int[] messageLengthForCounter = new int[] {
+                10_000,
+                10_000,
+                10_000,
+                150_000,
+                160_000,
+                170_000,
+                180_000,
+                10_000,
+                10_000,
+                10_000
+        };
+
+        List<SendMessageBatchRequestEntry> batchEntries = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            int messageLength = messageLengthForCounter[i];
+            String messageBody = generateStringWithLength(messageLength);
+            SendMessageBatchRequestEntry entry = SendMessageBatchRequestEntry.builder()
+                    .id("entry_" + i)
+                    .messageBody(messageBody)
+                    .build();
+            batchEntries.add(entry);
+        }
+
+        SendMessageBatchRequest batchRequest = SendMessageBatchRequest.builder().queueUrl(SQS_QUEUE_URL).entries(batchEntries).build();
+        extendedSqsWithDefaultConfig.sendMessageBatch(batchRequest).join();
+
+        // There should be 3 puts for the 3 largest messages as sum of sizes of others should be within limit
+        verify(mockS3, times(3)).putObject(isA(PutObjectRequest.class), isA(AsyncRequestBody.class));
     }
 
     @Test

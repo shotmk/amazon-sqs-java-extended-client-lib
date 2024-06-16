@@ -462,8 +462,6 @@ public class AmazonSQSExtendedClientTest {
 
     @Test
     public void testWhenMessageBatchWithTotalSizeOverTheLimitIsSentThenLargestEntriesAreStoredInS3() {
-        // This creates 10 messages, out of which only two are below the threshold (100K and 150K),
-        // and the other 8 are above the threshold
 
         int[] messageLengthForCounter = new int[] {
                 10_000,
