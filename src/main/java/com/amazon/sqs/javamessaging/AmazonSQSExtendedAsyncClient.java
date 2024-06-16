@@ -7,6 +7,7 @@ import static com.amazon.sqs.javamessaging.AmazonSQSExtendedClientUtil.getOrigRe
 import static com.amazon.sqs.javamessaging.AmazonSQSExtendedClientUtil.getReservedAttributeNameIfPresent;
 import static com.amazon.sqs.javamessaging.AmazonSQSExtendedClientUtil.isLarge;
 import static com.amazon.sqs.javamessaging.AmazonSQSExtendedClientUtil.isS3ReceiptHandle;
+import static com.amazon.sqs.javamessaging.AmazonSQSExtendedClientUtil.sizeOf;
 import static com.amazon.sqs.javamessaging.AmazonSQSExtendedClientUtil.updateMessageAttributePayloadSize;
 
 import java.util.ArrayList;
@@ -17,6 +18,8 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import software.amazon.awssdk.awscore.AwsRequest;
@@ -44,6 +47,7 @@ import software.amazon.awssdk.services.sqs.model.SendMessageBatchRequestEntry;
 import software.amazon.awssdk.services.sqs.model.SendMessageBatchResponse;
 import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
 import software.amazon.awssdk.services.sqs.model.SendMessageResponse;
+import software.amazon.awssdk.utils.Pair;
 import software.amazon.awssdk.utils.StringUtils;
 import software.amazon.payloadoffloading.PayloadStoreAsync;
 import software.amazon.payloadoffloading.S3AsyncDao;
@@ -341,37 +345,15 @@ public class AmazonSQSExtendedAsyncClient extends AmazonSQSExtendedAsyncClientBa
             return super.sendMessageBatch(sendMessageBatchRequest);
         }
 
-        List<CompletableFuture<SendMessageBatchRequestEntry>> batchEntryFutures = new ArrayList<>(
-            sendMessageBatchRequest.entries().size());
-        boolean hasS3Entries = false;
-        for (SendMessageBatchRequestEntry entry : sendMessageBatchRequest.entries()) {
-            //Check message attributes for ExtendedClient related constraints
-            checkMessageAttributes(clientConfiguration.getPayloadSizeThreshold(), entry.messageAttributes());
-
-            if (clientConfiguration.isAlwaysThroughS3()
-                || isLarge(clientConfiguration.getPayloadSizeThreshold(), entry)) {
-                batchEntryFutures.add(storeMessageInS3(entry));
-                hasS3Entries = true;
-            } else {
-                batchEntryFutures.add(CompletableFuture.completedFuture(entry));
-            }
-        }
-
-        if (!hasS3Entries) {
-            return super.sendMessageBatch(sendMessageBatchRequest);
-        }
-
-        // Convert list of entry futures to a future list of entries.
-        return CompletableFuture.allOf(
-                batchEntryFutures.toArray(new CompletableFuture[batchEntryFutures.size()]))
-            .thenApply(v -> batchEntryFutures.stream()
-                .map(CompletableFuture::join)
-                .collect(Collectors.toList()))
-            .thenCompose(batchEntries -> {
-                SendMessageBatchRequest modifiedBatchRequest =
-                    sendMessageBatchRequest.toBuilder().entries(batchEntries).build();
-                return super.sendMessageBatch(modifiedBatchRequest);
-            });
+        return CompletableFuture.supplyAsync(() -> new SendBatchHelper(clientConfiguration, sendMessageBatchRequest.entries()))
+                .thenApply(SendBatchHelper::storeInS3IfNeeded)
+                .thenApply(CompletableFuture::join)
+                .thenApply(SendBatchHelper::getEntries)
+                .thenCompose(batchEntries -> {
+                    SendMessageBatchRequest modifiedBatchRequest =
+                            sendMessageBatchRequest.toBuilder().entries(batchEntries).build();
+                    return super.sendMessageBatch(modifiedBatchRequest);
+                });
     }
 
     /**
@@ -508,4 +490,128 @@ public class AmazonSQSExtendedAsyncClient extends AmazonSQSExtendedAsyncClientBa
     private static <T extends AwsRequest.Builder> T appendUserAgent(final T builder) {
         return AmazonSQSExtendedClientUtil.appendUserAgent(builder, USER_AGENT_NAME, USER_AGENT_VERSION);
     }
+
+
+
+    private class SendBatchHelper {
+        private final ExtendedAsyncClientConfiguration clientConfiguration;
+
+        private final List<SendMessageBatchRequestEntry> entries;
+        private final List<Pair<Integer, Long>> entrySizes;
+        private final List<Integer> alreadyMovedEntries;
+        private long totalSize;
+
+        public SendBatchHelper(ExtendedAsyncClientConfiguration clientConfiguration, List<SendMessageBatchRequestEntry> entries) {
+            this.clientConfiguration = clientConfiguration;
+            this.entries = new ArrayList<>(entries);
+            this.entrySizes = IntStream.range(0, entries.size())
+                    .boxed()
+                    .map(i -> Pair.of(i, sizeOf(entries.get(i))))
+                    .collect(Collectors.toList());
+            this.totalSize = entrySizes.stream().map(Pair::right).mapToLong(Long::longValue).sum();
+            this.alreadyMovedEntries = new ArrayList<>(entries.size());
+        }
+
+        public List<SendMessageBatchRequestEntry> getEntries() {
+            return entries;
+        }
+
+        public long getTotalSize() {
+            return totalSize;
+        }
+
+        /**
+         * Get the largest entry that has not been moved to S3 yet
+         * @return metadata of largest not yet moved entry or empty if all entries have been moved
+         */
+        private Optional<LargestEntryWithMetadata> getLargestNotYetMovedEntry() {
+            long largestEntrySize = -1;
+            int largestEntryIdx = -1;
+            for (Pair<Integer, Long> entryPair : entrySizes) {
+                Integer currentEntryIdx = entryPair.left();
+                if (alreadyMovedEntries.contains(currentEntryIdx)) {
+                    continue;
+                }
+                Long currentEntrySize = entryPair.right();
+                if(largestEntrySize < currentEntrySize) {
+                    largestEntrySize = currentEntrySize;
+                    largestEntryIdx = currentEntryIdx;
+                }
+            }
+            if (largestEntryIdx == -1) {
+                // we moved all entries
+                return Optional.empty();
+            }
+            return Optional.of(
+                    new LargestEntryWithMetadata(entries.get(largestEntryIdx), largestEntryIdx, largestEntrySize)
+            );
+        }
+
+        /**
+         * Move the largest entry to S3
+         * @return a future that completes with true if the entry was moved to S3, false otherwise
+         */
+        public CompletableFuture<Boolean> moveLargestEntryToS3() {
+            Optional<LargestEntryWithMetadata> largestNotYetMovedEntry = getLargestNotYetMovedEntry();
+            if (!largestNotYetMovedEntry.isPresent()) {
+                return CompletableFuture.completedFuture(false);
+            }
+            LargestEntryWithMetadata entryWithMeta = largestNotYetMovedEntry.get();
+            SendMessageBatchRequestEntry largestEntry = entryWithMeta.getEntry();
+            checkMessageAttributes(this.clientConfiguration.getPayloadSizeThreshold(), largestEntry.messageAttributes());
+            return storeMessageInS3(largestEntry)
+                .thenApply(modifiedEntry -> {
+                    alreadyMovedEntries.add(entryWithMeta.getIndex());
+                    entries.set(entryWithMeta.getIndex(), modifiedEntry);
+                    totalSize = totalSize - entryWithMeta.getSize() + sizeOf(modifiedEntry);
+                    return true;
+                });
+
+        }
+
+
+        public CompletableFuture<SendBatchHelper> storeInS3IfNeeded() {
+            // Verify that total size of batch request is within limits
+            if (this.getTotalSize() <= clientConfiguration.getPayloadSizeThreshold() && !clientConfiguration.isAlwaysThroughS3()) {
+                return CompletableFuture.completedFuture(this);
+            }
+            // move the largest entry to S3
+            return this.moveLargestEntryToS3()
+                    // call recursively to check if there are more entries to move to S3
+                    .thenCompose(actuallyMoved -> {
+                        if (actuallyMoved) {
+                            return storeInS3IfNeeded();
+                        } else {
+                            // no more entries to move to S3
+                            return CompletableFuture.completedFuture(this);
+                        }
+                    });
+        }
+
+    }
+
+    private static class LargestEntryWithMetadata {
+        private final SendMessageBatchRequestEntry entry;
+        private final int index;
+        private final long size;
+
+        public LargestEntryWithMetadata(SendMessageBatchRequestEntry entry, int index, long size) {
+            this.entry = entry;
+            this.index = index;
+            this.size = size;
+        }
+
+        public SendMessageBatchRequestEntry getEntry() {
+            return entry;
+        }
+
+        public int getIndex() {
+            return index;
+        }
+
+        public long getSize() {
+            return size;
+        }
+    }
+
 }
